@@ -75,12 +75,18 @@ Ctrl-C to quit (sends MIDI stop and closes the port).
 - To capture system audio you need a loopback driver:
   `brew install blackhole-2ch`, then set BlackHole (or a Multi-Output
   device including it) as the Mac's output.
-- The MIDI clock is *tempo*-synced, not *phase*-locked: it runs at the
-  detected BPM but its downbeat is free-running. Link peers phase-align
-  among themselves as usual.
 - Detection uses a spectral-flux onset envelope + autocorrelation with
   octave disambiguation; verified accurate to ±0.1 BPM on synthetic
   material from 85–174 BPM (`test_detector.py`).
+- **Phase lock**: beat positions are found by folding the onset envelope
+  at the beat period (histogram peak), feeding a low-gain phase-locked
+  beat grid. The Link session is snapped once (`force_beat`) then
+  micro-steered so Link beats land on the music's beats — measured ~5 ms
+  phase error on synthetic beats (`test_phase.py`), ~15 ms live. MIDI
+  clock pulses are servo-locked to the same grid. Beat-level sync only:
+  bar downbeats (quantum > 1) are not detected.
+- Use **Beat Nudge** (menu) or `--nudge-ms` to dial out any constant
+  offset you see against your visuals — like a DJ nudge.
 
 ## Setup from scratch
 

@@ -14,6 +14,7 @@ Usage:
 import argparse
 import asyncio
 import collections
+import math
 import sys
 import threading
 import time
@@ -74,6 +75,8 @@ class TempoEstimator:
         self.bpm = None          # smoothed, published value
         self.confidence = 0.0
         self.signal = False
+        self.beat_offset = None  # seconds from window end back to the last beat
+        self.phase_quality = 0.0
 
     def _onset_envelope(self, audio):
         frames = np.lib.stride_tricks.sliding_window_view(audio, FFT_SIZE)[::HOP]
@@ -95,10 +98,11 @@ class TempoEstimator:
         self.signal = rms > 1e-4
         if not self.signal:
             self.confidence = 0.0
+            self.beat_offset = None
             return
 
-        env = self._onset_envelope(audio)
-        env = env - env.mean()
+        env0 = self._onset_envelope(audio)
+        env = env0 - env0.mean()
         acf = np.correlate(env, env, mode="full")[len(env) - 1:]
         if acf[0] <= 0:
             return
@@ -140,6 +144,85 @@ class TempoEstimator:
         if self.bpm is None or abs(median - self.bpm) > 0.25:
             self.bpm = round(median, 1)
 
+        # beat phase: fold onset energy at the beat period into a histogram
+        # and take its peak — robust to the envelope's asymmetric decay tails
+        self.beat_offset = None
+        if self.bpm:
+            period = self.frame_rate * 60.0 / self.bpm
+            n = len(env0)
+            d = np.arange(n - 1, -1, -1, dtype=np.float64)  # frames before end
+            w = env0 * np.exp(-d / (4.0 * self.frame_rate))  # favour recent audio
+            nbins = int(round(period))
+            hist = np.zeros(nbins)
+            np.add.at(hist, np.round(d % period).astype(int) % nbins, w)
+            kern = np.hanning(5)
+            hist = np.convolve(np.tile(hist, 3), kern / kern.sum(),
+                               "same")[nbins:2 * nbins]
+            mean = float(hist.mean())
+            if mean > 0:
+                j = int(np.argmax(hist))
+                self.phase_quality = float(hist[j]) / mean  # peak prominence
+                if self.phase_quality > 1.8:
+                    y0, y1, y2 = hist[(j - 1) % nbins], hist[j], hist[(j + 1) % nbins]
+                    den = y0 - 2 * y1 + y2
+                    off = (j + (0.5 * (y0 - y2) / den
+                                if abs(den) > 1e-12 else 0.0)) % period
+                    # frames -> seconds from the buffer end, plus a measured
+                    # constant: spectral flux fires ~22 ms ahead of the beat
+                    self.beat_offset = (off * HOP + FFT_SIZE) / self.sr - 0.022
+
+
+# ---------------------------------------------------------------- beat grid
+
+class BeatGrid:
+    """Phase-locked beat grid: perf_counter times at which beats occur.
+
+    Fed with measured beat times; converges with a small gain so single
+    noisy measurements can't yank the phase around.
+    """
+
+    def __init__(self):
+        self.t0 = None
+        self.period = None
+        self.locked = False
+
+    def update(self, beat_time, bpm, quality):
+        period = 60.0 / bpm
+        if self.t0 is None or abs(period - self.period) / period > 0.08:
+            self.t0, self.period, self.locked = beat_time, period, False
+            return
+        self.period = period
+        err = beat_time - self.t0
+        err -= round(err / period) * period
+        self.t0 += (0.25 if quality > 2.5 else 0.08) * err
+        self.t0 += round((beat_time - self.t0) / period) * period  # stay near now
+        self.locked = True
+
+    def next_beat(self, now):
+        return self.t0 + math.ceil((now - self.t0) / self.period) * self.period
+
+    def phase(self, now):
+        return ((now - self.t0) / self.period) % 1.0
+
+
+def steer_link(link, grid, bpm):
+    """Align the Link session's beats to our grid. Must run on the Link
+    thread/loop. link.time shares perf_counter's clock base on macOS,
+    so beat<->wall-time mapping is exact. Returns residual phase error (s)."""
+    now = time.perf_counter()
+    target = grid.next_beat(now + 0.05)
+    beat_at_target = link.beat + (target - now) * link.tempo / 60.0
+    err_beats = (beat_at_target + 0.5) % 1.0 - 0.5
+    err_sec = err_beats * grid.period
+    if abs(err_sec) > 0.12:
+        # far off (startup / track change): snap the session grid once
+        link.tempo = bpm
+        link.force_beat(round(beat_at_target) - (target - now) * bpm / 60.0)
+        return 0.0
+    # in range: slew tempo a touch so the residual decays over ~8 s
+    link.tempo = bpm - max(-0.5, min(0.5, err_sec * 60.0 / (grid.period * 8.0)))
+    return err_sec
+
 
 # ---------------------------------------------------------------- midi clock
 
@@ -153,6 +236,7 @@ class MidiClock(threading.Thread):
         self.running = threading.Event()
         self.stop_flag = threading.Event()
         self.on_beat = None  # called every 24th clock (once per beat)
+        self.sync = None     # (beat_time, period) grid to phase-lock against
 
     def run(self):
         self.running.wait()
@@ -162,6 +246,13 @@ class MidiClock(threading.Thread):
         while not self.stop_flag.is_set():
             interval = 60.0 / (self.bpm * 24.0)
             next_t += interval
+            sync = self.sync
+            if sync:
+                beat_time, period = sync
+                tick = period / 24.0
+                err = (next_t - beat_time + tick / 2) % tick - tick / 2
+                limit = interval * 0.03
+                next_t -= max(-limit, min(limit, err * 0.2))
             self.port.send(mido.Message("clock"))
             if pulses % 24 == 0 and self.on_beat:
                 self.on_beat()
@@ -240,10 +331,14 @@ async def main(args):
     print()
 
     window = int(estimator.window_sec * samplerate)
+    grid = BeatGrid()
     started = False
     with stream:
+        latency = stream.latency if isinstance(stream.latency, float) \
+            else stream.latency[0]
         while True:
             await asyncio.sleep(0.5)
+            t_end = time.perf_counter()
             estimator.update(ring.latest(window))
             bpm = estimator.bpm
             if bpm and estimator.signal and estimator.confidence >= args.min_conf:
@@ -251,13 +346,23 @@ async def main(args):
                 if not started:
                     clock.running.set()
                     started = True
+                if estimator.beat_offset is not None:
+                    measured = (t_end - latency - estimator.beat_offset
+                                + args.nudge_ms / 1000.0)
+                    grid.update(measured, bpm, estimator.phase_quality)
+                    if grid.locked:
+                        clock.sync = (grid.t0, grid.period)
                 if link:
-                    link.tempo = bpm
+                    if grid.locked:
+                        steer_link(link, grid, bpm)
+                    else:
+                        link.tempo = bpm
             peers = f"  link peers: {link.num_peers}" if link else ""
             state = f"{bpm:6.1f} BPM" if bpm else "  ...   "
+            lock = "  [lock]" if grid.locked else ""
             sig = "" if estimator.signal else "  [no signal]"
-            print(f"\r  ♪ {state}   conf {estimator.confidence:4.2f}{peers}{sig}   ",
-                  end="", flush=True)
+            print(f"\r  ♪ {state}   conf {estimator.confidence:4.2f}"
+                  f"{peers}{lock}{sig}   ", end="", flush=True)
 
 
 if __name__ == "__main__":
@@ -271,6 +376,8 @@ if __name__ == "__main__":
     p.add_argument("--no-link", action="store_true", help="disable Ableton Link")
     p.add_argument("--min-conf", type=float, default=0.25,
                    help="confidence needed before tempo is broadcast (default 0.25)")
+    p.add_argument("--nudge-ms", type=float, default=0.0,
+                   help="shift the beat grid by this many ms (like a DJ nudge)")
     args = p.parse_args()
 
     if args.list_devices:

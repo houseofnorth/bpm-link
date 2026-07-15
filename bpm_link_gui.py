@@ -25,7 +25,7 @@ from AppKit import (
 )
 from Foundation import NSUserDefaults
 
-from bpm_link import AudioRing, TempoEstimator, MidiClock
+from bpm_link import AudioRing, BeatGrid, MidiClock, TempoEstimator, steer_link
 
 try:
     import aalink
@@ -95,6 +95,10 @@ class LinkWorker(threading.Thread):
             self.loop.call_soon_threadsafe(
                 lambda: setattr(self.link, "enabled", bool(on)))
 
+    def align(self, grid, bpm):
+        if self.ready.is_set():
+            self.loop.call_soon_threadsafe(steer_link, self.link, grid, bpm)
+
     @property
     def peers(self):
         return self.link.num_peers if self.ready.is_set() else 0
@@ -118,6 +122,9 @@ class Engine:
         self.link_on = True
         self.started = False
         self.last_beat = 0.0
+        self.grid = BeatGrid()
+        self.nudge_ms = 0.0
+        self.latency = 0.0
 
         self.clock = MidiClock("BPM-Link Clock")
         self.clock.on_beat = lambda: setattr(self, "last_beat", time.time())
@@ -157,6 +164,9 @@ class Engine:
                     samplerate=sr, blocksize=256, dtype="float32",
                     callback=callback)
                 self.stream.start()
+                lat = self.stream.latency
+                self.latency = lat if isinstance(lat, float) else lat[0]
+                self.grid = BeatGrid()  # new device, new phase
                 self.ring = ring
                 self.samplerate = sr
                 self.estimator = TempoEstimator(sr, self.min_bpm, self.max_bpm)
@@ -173,22 +183,33 @@ class Engine:
         while not self._stop.is_set():
             time.sleep(0.5)
             with self.lock:
-                ring, est = self.ring, self.estimator
+                ring, est, grid = self.ring, self.estimator, self.grid
             if not ring:
                 continue
+            t_end = time.perf_counter()
             est.update(ring.latest(int(est.window_sec * est.sr)))
             if est.bpm and est.signal and est.confidence >= self.min_conf:
                 self.clock.bpm = est.bpm
                 if not self.started:
                     self.clock.running.set()
                     self.started = True
+                if est.beat_offset is not None:
+                    measured = (t_end - self.latency - est.beat_offset
+                                + self.nudge_ms / 1000.0)
+                    grid.update(measured, est.bpm, est.phase_quality)
+                    if grid.locked:
+                        self.clock.sync = (grid.t0, grid.period)
                 if self.link and self.link_on:
-                    self.link.set_tempo(est.bpm)
+                    if grid.locked:
+                        self.link.align(grid, est.bpm)
+                    else:
+                        self.link.set_tempo(est.bpm)
 
     # -- state for the UI
 
     def state(self):
         est = self.estimator
+        grid = self.grid
         return {
             "bpm": est.bpm if est else None,
             "conf": est.confidence if est else 0.0,
@@ -198,6 +219,8 @@ class Engine:
             "peers": self.link.peers if self.link else 0,
             "link_on": self.link_on and self.link is not None,
             "clock_running": self.started,
+            "locked": grid.locked,
+            "phase": grid.phase(time.perf_counter()) if grid.locked else None,
             "error": self.error,
             "last_beat": self.last_beat,
         }
@@ -242,10 +265,13 @@ class BauhausView(NSView):
         BLUE.set()
         NSBezierPath.fillRect_(NSMakeRect(0, 0, 8, H))
 
-        # beat dot: red circle that pulses on every MIDI-clock beat
-        bpm = s["bpm"] or 120.0
-        decay = (time.time() - s["last_beat"]) / (60.0 / bpm * 0.6)
-        r = 6 + 5 * max(0.0, 1.0 - decay) if s["clock_running"] else 6
+        # beat dot: red circle that pulses on the detected beat
+        if s["phase"] is not None:
+            r = 6 + 5 * max(0.0, 1.0 - s["phase"] / 0.5)
+        else:
+            bpm = s["bpm"] or 120.0
+            decay = (time.time() - s["last_beat"]) / (60.0 / bpm * 0.6)
+            r = 6 + 5 * max(0.0, 1.0 - decay) if s["clock_running"] else 6
         (RED if s["signal"] else PAPER.colorWithAlphaComponent_(0.25)).set()
         NSBezierPath.bezierPathWithOvalInRect_(
             NSMakeRect(32 - r, 70 - r, 2 * r, 2 * r)).fill()
@@ -269,8 +295,9 @@ class BauhausView(NSView):
             else:
                 l1 = (f"{(s['device'] or 'NO DEVICE').upper()[:22]}"
                       f"  ·  {int((s['samplerate'] or 0)/1000)}K")
-                l2 = (f"LINK {s['peers']}  ·  CONF {s['conf']:.2f}"
-                      f"  ·  {'RUN' if s['clock_running'] else 'IDLE'}"
+                run = ("LOCK" if s["locked"]
+                       else "RUN" if s["clock_running"] else "IDLE")
+                l2 = (f"LINK {s['peers']}  ·  CONF {s['conf']:.2f}  ·  {run}"
                       f"{'' if s['signal'] else '  ·  NO SIGNAL'}")
             attr(l1, futura(8, "Medium"), dim, kern=1.0)\
                 .drawAtPoint_(NSMakePoint(20, 20))
@@ -288,6 +315,7 @@ class AppDelegate(NSObject):
 
         # restore settings
         self.engine.link_on = self.defaults.objectForKey_("link") in (None, True, 1)
+        self.engine.nudge_ms = float(self.defaults.integerForKey_("nudge"))
         saved_device = self.defaults.stringForKey_("device")
         self._pick_initial_device(saved_device)
 
@@ -381,6 +409,20 @@ class AppDelegate(NSObject):
         self.link_item.setState_(1 if self.engine.link_on and HAVE_LINK else 0)
         self.link_item.setEnabled_(HAVE_LINK)
         menu.addItem_(self.link_item)
+
+        nudge_root = NSMenuItem.alloc()\
+            .initWithTitle_action_keyEquivalent_("Beat Nudge", None, "")
+        self.nudge_menu = NSMenu.alloc().init()
+        self.nudge_menu.setAutoenablesItems_(False)
+        for ms in (-60, -40, -20, 0, 20, 40, 60):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"{ms:+d} ms" if ms else "0 ms", "pickNudge:", "")
+            item.setTarget_(self)
+            item.setTag_(ms)
+            item.setState_(1 if ms == int(self.engine.nudge_ms) else 0)
+            self.nudge_menu.addItem_(item)
+        nudge_root.setSubmenu_(self.nudge_menu)
+        menu.addItem_(nudge_root)
         menu.addItem_(NSMenuItem.separatorItem())
 
         quit_item = NSMenuItem.alloc()\
@@ -433,6 +475,12 @@ class AppDelegate(NSObject):
             self.engine.link.set_enabled(self.engine.link_on)
         self.link_item.setState_(1 if self.engine.link_on else 0)
         self.defaults.setBool_forKey_(self.engine.link_on, "link")
+
+    def pickNudge_(self, sender):
+        self.engine.nudge_ms = float(sender.tag())
+        for item in self.nudge_menu.itemArray():
+            item.setState_(1 if item.tag() == sender.tag() else 0)
+        self.defaults.setInteger_forKey_(sender.tag(), "nudge")
 
     def pickDevice_(self, sender):
         # sounddevice must re-scan so a fresh index is valid
