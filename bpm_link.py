@@ -214,13 +214,18 @@ def steer_link(link, grid, bpm):
     beat_at_target = link.beat + (target - now) * link.tempo / 60.0
     err_beats = (beat_at_target + 0.5) % 1.0 - 0.5
     err_sec = err_beats * grid.period
-    if abs(err_sec) > 0.12:
+    if abs(err_sec) > 0.08:
         # far off (startup / track change): snap the session grid once
         link.tempo = bpm
         link.force_beat(round(beat_at_target) - (target - now) * bpm / 60.0)
         return 0.0
-    # in range: slew tempo a touch so the residual decays over ~8 s
-    link.tempo = bpm - max(-0.5, min(0.5, err_sec * 60.0 / (grid.period * 8.0)))
+    if abs(err_sec) < 0.02:
+        # aligned (within ~a laser frame): publish the exact tempo so
+        # peers display the true BPM instead of a steering wobble
+        link.tempo = bpm
+        return err_sec
+    # drifting: slew tempo a touch so the residual decays over ~5 s
+    link.tempo = bpm - max(-0.3, min(0.3, err_sec * 60.0 / (grid.period * 5.0)))
     return err_sec
 
 
@@ -352,11 +357,12 @@ async def main(args):
                     grid.update(measured, bpm, estimator.phase_quality)
                     if grid.locked:
                         clock.sync = (grid.t0, grid.period)
-                if link:
-                    if grid.locked:
-                        steer_link(link, grid, bpm)
-                    else:
-                        link.tempo = bpm
+                if link and not grid.locked:
+                    link.tempo = bpm
+            # steer every tick once locked, even through low-confidence
+            # stretches — otherwise a stale slewed tempo sticks on the session
+            if link and bpm and grid.locked:
+                steer_link(link, grid, bpm)
             peers = f"  link peers: {link.num_peers}" if link else ""
             state = f"{bpm:6.1f} BPM" if bpm else "  ...   "
             lock = "  [lock]" if grid.locked else ""
@@ -374,8 +380,8 @@ if __name__ == "__main__":
     p.add_argument("--min-bpm", type=float, default=70.0)
     p.add_argument("--max-bpm", type=float, default=180.0)
     p.add_argument("--no-link", action="store_true", help="disable Ableton Link")
-    p.add_argument("--min-conf", type=float, default=0.25,
-                   help="confidence needed before tempo is broadcast (default 0.25)")
+    p.add_argument("--min-conf", type=float, default=0.15,
+                   help="confidence needed before tempo is broadcast (default 0.15)")
     p.add_argument("--nudge-ms", type=float, default=0.0,
                    help="shift the beat grid by this many ms (like a DJ nudge)")
     args = p.parse_args()

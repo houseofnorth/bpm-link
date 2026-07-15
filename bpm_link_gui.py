@@ -109,7 +109,7 @@ class LinkWorker(threading.Thread):
 class Engine:
     """Audio in → tempo estimate → MIDI clock + Link, on worker threads."""
 
-    def __init__(self, min_conf=0.25):
+    def __init__(self, min_conf=0.15):
         self.lock = threading.Lock()
         self.stream = None
         self.ring = None
@@ -199,11 +199,12 @@ class Engine:
                     grid.update(measured, est.bpm, est.phase_quality)
                     if grid.locked:
                         self.clock.sync = (grid.t0, grid.period)
-                if self.link and self.link_on:
-                    if grid.locked:
-                        self.link.align(grid, est.bpm)
-                    else:
-                        self.link.set_tempo(est.bpm)
+                if self.link and self.link_on and not grid.locked:
+                    self.link.set_tempo(est.bpm)
+            # steer every tick once locked, even through low-confidence
+            # stretches — otherwise a stale slewed tempo sticks on the session
+            if self.link and self.link_on and est.bpm and grid.locked:
+                self.link.align(grid, est.bpm)
 
     # -- state for the UI
 
